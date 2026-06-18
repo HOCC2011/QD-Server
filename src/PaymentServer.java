@@ -10,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
@@ -19,11 +20,16 @@ import java.util.concurrent.Executors;
 public class PaymentServer {
 
     // In a real app, load this from ENV variables
-    private static final String SHARED_SECRET = "super_secure_shared_secret_key";
     private static final long TOKEN_VALIDITY_SECONDS = 60;
 
-    // Mock Database (User ID -> Balance)
+    // Mock Database (AccountID -> Balance)
     private static final Map<String, Double> userWallets = new ConcurrentHashMap<>();
+
+    // Mock Database (SessionToken -> AccountID)
+    private static final Map<String, String> SessionTokens = new ConcurrentHashMap<>();
+
+    // Mock Database (AccountID -> sharedSecret)
+    private static final Map<String, String> walletKeys = new ConcurrentHashMap<>();
 
     // Mock storage for processed tokens (Token -> Status)
     private static final Map<String, String> transactionStatus = new ConcurrentHashMap<>();
@@ -34,17 +40,31 @@ public class PaymentServer {
         userWallets.put("user_12345", 500.00);
         userWallets.put("merc_999", 0.00);
 
-        HttpServer server = HttpServer.create(new InetSocketAddress(8000), 0);
+        walletKeys.put("user_123", "5f10105fdbb3a24432b9a369333ed49b".toUpperCase());
+        walletKeys.put("user_12345", "6a93c1103170cfeedfc4d57cac445870".toUpperCase());
+        walletKeys.put("merc_999", "f4ee130a0e5d68884d70df55602ffa3c".toUpperCase());
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(4800), 0);
 
         // Define Endpoints
         server.createContext("/health", exchange -> sendResponse(exchange, 200, "OK"));
         server.createContext("/transaction/process", new TransactionHandler());
         server.createContext("/transaction/status", new StatusHandler());
+        server.createContext("/getSessionToken", new SessionTokenHandler());
+        server.createContext("/getKey", new KeyHandler());
         server.createContext("/balance", new BalanceHandler());
+        server.createContext("/UploadCarbonLess", new CarbonLessHandler());
 
         server.setExecutor(Executors.newCachedThreadPool()); // Java 19+ feature, or use newCachedThreadPool for 17
-        System.out.println("Server started on port 8000...");
+        System.out.println("Server started on port 480...");
         server.start();
+    }
+
+    static class CarbonLessHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            sendResponse(exchange, 404, "404 Not Found");
+        }
     }
 
     static class StatusHandler implements HttpHandler {
@@ -62,18 +82,48 @@ public class PaymentServer {
     static class BalanceHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            // Expecting GET /balance?userId=user_123
+            // Expecting GET /balance?AccountID=user_123
             String query = exchange.getRequestURI().getQuery();
             if (query == null || !query.contains("=")) {
-                sendResponse(exchange, 400, "Missing userId");
+                sendResponse(exchange, 400, "Missing AccountID");
                 return;
             }
 
-            String userId = query.split("=")[1];
-            Double balance = userWallets.getOrDefault(userId, 0.0);
+            String AccountID = query.split("=")[1];
+            Double balance = userWallets.getOrDefault(AccountID, 0.0);
 
             // Return balance as a plain string (e.g., "500.00")
             sendResponse(exchange, 200, String.format("%.2f", balance));
+        }
+    }
+
+    static class SessionTokenHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // Expecting GET /getSessionToken?AccountID=user_123
+            String query = exchange.getRequestURI().getQuery();
+            if (query == null || !query.contains("=")) {
+                sendResponse(exchange, 400, "Missing AccountID");
+                return;
+            }
+
+            String AccountID = query.split("=")[1];
+            String SessionToken = GenerateData(16);
+
+            SessionTokens.put(SessionToken, AccountID);
+            sendResponse(exchange, 200, SessionToken);
+        }
+    }
+
+    static class KeyHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String SessionToken = exchange.getRequestHeaders().getFirst("Authorization");
+            if (SessionToken != null && SessionTokens.containsKey(SessionToken)) {
+                sendResponse(exchange, 200, walletKeys.get(SessionTokens.get(SessionToken)));
+            } else {
+                sendResponse(exchange, 400, "Unauthorized");
+            }
         }
     }
 
@@ -113,13 +163,13 @@ public class PaymentServer {
 
         private void processPayment(PaymentRequest req) throws Exception {
             // 1. Parse and Validate Token
-            // Token Format: base64(userId:timestamp:signature)
+            // Token Format: base64(AccountID:timestamp:signature)
             String decoded = new String(Base64.getDecoder().decode(req.scannedToken), StandardCharsets.UTF_8);
-            String[] tokenParts = decoded.split(":"); // [userId, timestamp, signature]
+            String[] tokenParts = decoded.split(":"); // [AccountID, timestamp, signature]
 
             if (tokenParts.length != 3) throw new IllegalArgumentException("Corrupted Token");
 
-            String userId = tokenParts[0];
+            String AccountID = tokenParts[0];
             long timestamp = Long.parseLong(tokenParts[1]);
             String receivedSig = tokenParts[2];
 
@@ -129,8 +179,8 @@ public class PaymentServer {
             }
 
             // 3. Verify Signature
-            String payload = userId + ":" + timestamp;
-            String expectedSig = hmacSha256(payload, SHARED_SECRET);
+            String payload = AccountID + ":" + timestamp;
+            String expectedSig = hmacSha256(payload, walletKeys.get(AccountID));
 
             if (!expectedSig.equals(receivedSig)) {
                 throw new IllegalArgumentException("Invalid Signature");
@@ -138,14 +188,14 @@ public class PaymentServer {
 
             // 4. Execute Transaction
             synchronized (userWallets) {
-                double userBal = userWallets.getOrDefault(userId, 0.0);
+                double userBal = userWallets.getOrDefault(AccountID, 0.0);
                 if (userBal < req.amount) throw new IllegalArgumentException("Insufficient Funds");
 
-                userWallets.put(userId, userBal - req.amount);
+                userWallets.put(AccountID, userBal - req.amount);
                 userWallets.put(req.merchantId, userWallets.getOrDefault(req.merchantId, 0.0) + req.amount);
 
                 transactionStatus.put(req.scannedToken(), "SUCCESS");
-                System.out.printf("Transferred $%.2f from %s to %s%n", req.amount, userId, req.merchantId);
+                System.out.printf("Transferred $%.2f from %s to %s%n", req.amount, AccountID, req.merchantId);
             }
         }
     }
@@ -155,6 +205,23 @@ public class PaymentServer {
         SecretKeySpec secret_key = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
         sha256_HMAC.init(secret_key);
         return bytesToHex(sha256_HMAC.doFinal(data.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static String GenerateData(int length) {
+        if (length <= 0) {
+            throw new IllegalArgumentException("Length must be greater than 0");
+        }
+
+        byte[] bytes = new byte[length];
+        SecureRandom random = new SecureRandom();
+        random.nextBytes(bytes);
+
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            hexString.append(String.format("%02X", b));
+        }
+
+        return hexString.toString(); // Hex string (e.g., "0A1B2C3D...")
     }
 
     private static String bytesToHex(byte[] bytes) {
